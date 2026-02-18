@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -227,5 +228,172 @@ func TestDeleteAuthFile_InvalidOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(validPath); err != nil {
 		t.Fatalf("expected valid file retained, err=%v", err)
+	}
+}
+
+func TestVerifyInvalidAuthFiles_CodexMarks401AsInvalid(t *testing.T) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+
+	auth := &coreauth.Auth{
+		ID:       "codex-401.json",
+		FileName: "codex-401.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"type":         "codex",
+			"access_token": "live-token",
+			"expired":      "2099-01-01T00:00:00Z",
+			"account_id":   "acct-401",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer live-token" {
+			t.Fatalf("unexpected authorization header: %q", got)
+		}
+		if got := r.Header.Get("Chatgpt-Account-Id"); got != "acct-401" {
+			t.Fatalf("unexpected account header: %q", got)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"account_deactivated"}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	originalProbeURL := codexUsageProbeURL
+	codexUsageProbeURL = srv.URL
+	t.Cleanup(func() {
+		codexUsageProbeURL = originalProbeURL
+	})
+
+	h := &Handler{
+		cfg:         &config.Config{AuthDir: authDir},
+		authManager: manager,
+		tokenStore:  store,
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/verify-invalid?provider=codex", nil)
+	h.VerifyInvalidAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got, _ := resp["invalid"].(float64); got != 1 {
+		t.Fatalf("expected invalid=1, got %v", resp["invalid"])
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("missing auth after verify")
+	}
+	invalid, reason := tokenInvalidState(updated)
+	if !invalid {
+		t.Fatalf("expected auth marked invalid")
+	}
+	if !strings.Contains(reason, "401") {
+		t.Fatalf("expected reason contains 401, got %q", reason)
+	}
+}
+
+func TestVerifyInvalidAuthFiles_CodexClearsInvalidOn2xx(t *testing.T) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+
+	auth := &coreauth.Auth{
+		ID:       "codex-200.json",
+		FileName: "codex-200.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{
+			"type":                 "codex",
+			"access_token":         "ok-token",
+			"expired":              "2099-01-01T00:00:00Z",
+			tokenInvalidMetaKey:    true,
+			tokenInvalidReasonKey:  "old reason",
+			tokenInvalidAtKey:      "2026-02-18T00:00:00Z",
+			"chatgpt_account_id":   "acct-200",
+			"chatgpt_plan_type":    "plus",
+			"chatgpt_subscription": "active",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer ok-token" {
+			t.Fatalf("unexpected authorization header: %q", got)
+		}
+		if got := r.Header.Get("Chatgpt-Account-Id"); got != "acct-200" {
+			t.Fatalf("unexpected account header: %q", got)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"plan_type":"free"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	originalProbeURL := codexUsageProbeURL
+	codexUsageProbeURL = srv.URL
+	t.Cleanup(func() {
+		codexUsageProbeURL = originalProbeURL
+	})
+
+	h := &Handler{
+		cfg:         &config.Config{AuthDir: authDir},
+		authManager: manager,
+		tokenStore:  store,
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/verify-invalid?provider=codex", nil)
+	h.VerifyInvalidAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got, _ := resp["valid"].(float64); got != 1 {
+		t.Fatalf("expected valid=1, got %v", resp["valid"])
+	}
+	if got, _ := resp["invalid"].(float64); got != 0 {
+		t.Fatalf("expected invalid=0, got %v", resp["invalid"])
+	}
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("missing auth after verify")
+	}
+	invalid, reason := tokenInvalidState(updated)
+	if invalid {
+		t.Fatalf("expected auth marked valid")
+	}
+	if reason != "" {
+		t.Fatalf("expected empty reason after success, got %q", reason)
 	}
 }

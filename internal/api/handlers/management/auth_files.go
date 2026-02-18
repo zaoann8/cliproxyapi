@@ -42,18 +42,21 @@ import (
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
 const (
-	anthropicCallbackPort   = 54545
-	geminiCallbackPort      = 8085
-	codexCallbackPort       = 1455
-	geminiCLIEndpoint       = "https://cloudcode-pa.googleapis.com"
-	geminiCLIVersion        = "v1internal"
-	geminiCLIUserAgent      = "google-api-nodejs-client/9.15.1"
-	geminiCLIApiClient      = "gl-node/22.17.0"
-	geminiCLIClientMetadata = "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI"
-	tokenInvalidMetaKey     = "token_invalid"
-	tokenInvalidReasonKey   = "token_invalid_reason"
-	tokenInvalidAtKey       = "token_invalid_at"
+	anthropicCallbackPort    = 54545
+	geminiCallbackPort       = 8085
+	codexCallbackPort        = 1455
+	geminiCLIEndpoint        = "https://cloudcode-pa.googleapis.com"
+	geminiCLIVersion         = "v1internal"
+	geminiCLIUserAgent       = "google-api-nodejs-client/9.15.1"
+	geminiCLIApiClient       = "gl-node/22.17.0"
+	geminiCLIClientMetadata  = "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI"
+	codexUsageProbeUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	tokenInvalidMetaKey      = "token_invalid"
+	tokenInvalidReasonKey    = "token_invalid_reason"
+	tokenInvalidAtKey        = "token_invalid_at"
 )
+
+var codexUsageProbeURL = "https://chatgpt.com/backend-api/wham/usage"
 
 type callbackForwarder struct {
 	provider string
@@ -888,78 +891,108 @@ func isSupportedTokenVerifyProvider(provider string) bool {
 	}
 }
 
-func codexTokenExpired(metadata map[string]any) bool {
-	if len(metadata) == 0 {
-		return false
-	}
-	expired := strings.TrimSpace(stringValue(metadata, "expired"))
-	if expired == "" {
-		return false
-	}
-	parseLayouts := []string{time.RFC3339, time.RFC3339Nano}
-	for _, layout := range parseLayouts {
-		if ts, err := time.Parse(layout, expired); err == nil {
-			return !ts.After(time.Now().Add(30 * time.Second))
-		}
-	}
-	return false
-}
-
 func (h *Handler) verifyCodexAuthToken(ctx context.Context, auth *coreauth.Auth) (bool, string, error) {
 	if auth == nil {
 		return true, "auth is nil", nil
 	}
-	metadata := auth.Metadata
-	accessToken := strings.TrimSpace(stringValue(metadata, "access_token"))
-	refreshToken := strings.TrimSpace(stringValue(metadata, "refresh_token"))
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	refreshCtx, cancelRefresh := context.WithTimeout(ctx, 20*time.Second)
+	defer cancelRefresh()
 
-	// Fast path: access token still valid, no need to hit upstream refresh endpoint.
-	if accessToken != "" && !codexTokenExpired(metadata) {
+	accessToken, errToken := h.refreshCodexOAuthAccessToken(refreshCtx, auth)
+	if errToken != nil {
+		return true, normalizeTokenInvalidReason(fmt.Sprintf("token refresh failed: %v", errToken)), nil
+	}
+	if strings.TrimSpace(accessToken) == "" {
+		return true, "token is empty", nil
+	}
+
+	statusCode, respBody, errProbe := h.probeCodexUsage(ctx, auth, accessToken)
+	if errProbe != nil {
+		// Probe failures (network/timeout) are not definitive invalid signals.
+		invalid, reason := tokenInvalidState(auth)
+		if invalid {
+			return true, reason, nil
+		}
 		return false, "", nil
 	}
 
-	if refreshToken != "" {
-		if h == nil || h.cfg == nil {
-			return true, "codex config unavailable", nil
-		}
-		refreshCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		defer cancel()
-		svc := codex.NewCodexAuth(h.cfg)
-		tokenData, err := svc.RefreshTokensWithRetry(refreshCtx, refreshToken, 3)
-		if err != nil {
-			return true, normalizeTokenInvalidReason(fmt.Sprintf("refresh failed: %v", err)), nil
-		}
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
-		}
-		auth.Metadata["type"] = "codex"
-		auth.Metadata["access_token"] = tokenData.AccessToken
-		if tokenData.RefreshToken != "" {
-			auth.Metadata["refresh_token"] = tokenData.RefreshToken
-		}
-		if tokenData.IDToken != "" {
-			auth.Metadata["id_token"] = tokenData.IDToken
-		}
-		if tokenData.AccountID != "" {
-			auth.Metadata["account_id"] = tokenData.AccountID
-		}
-		if tokenData.Email != "" {
-			auth.Metadata["email"] = tokenData.Email
-		}
-		if tokenData.Expire != "" {
-			auth.Metadata["expired"] = tokenData.Expire
-		}
-		auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
+	if statusCode == http.StatusUnauthorized {
+		return true, normalizeTokenInvalidReason(fmt.Sprintf("401 %s", strings.TrimSpace(respBody))), nil
+	}
+	if statusCode >= 200 && statusCode < 300 {
 		return false, "", nil
 	}
 
-	if accessToken == "" {
-		return true, "missing access_token and refresh_token", nil
-	}
-	if codexTokenExpired(metadata) {
-		return true, "access_token expired and refresh_token missing", nil
+	// Non-2xx/401 responses (e.g. 429/5xx) are treated as inconclusive.
+	invalid, reason := tokenInvalidState(auth)
+	if invalid {
+		return true, reason, nil
 	}
 	return false, "", nil
+}
+
+func (h *Handler) probeCodexUsage(ctx context.Context, auth *coreauth.Auth, accessToken string) (int, string, error) {
+	if strings.TrimSpace(accessToken) == "" {
+		return 0, "", fmt.Errorf("missing access token")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancelProbe := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelProbe()
+
+	req, errReq := http.NewRequestWithContext(probeCtx, http.MethodGet, codexUsageProbeURL, nil)
+	if errReq != nil {
+		return 0, "", errReq
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", codexUsageProbeUserAgent)
+	if accountID := codexAccountID(auth); accountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", accountID)
+	}
+
+	httpClient := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: h.apiCallTransport(auth),
+	}
+	resp, errDo := httpClient.Do(req)
+	if errDo != nil {
+		return 0, "", errDo
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	bodyBytes, errRead := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if errRead != nil {
+		return resp.StatusCode, "", errRead
+	}
+	return resp.StatusCode, string(bodyBytes), nil
+}
+
+func codexAccountID(auth *coreauth.Auth) string {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return ""
+	}
+	for _, key := range []string{"account_id", "chatgpt_account_id"} {
+		if value := strings.TrimSpace(stringValue(auth.Metadata, key)); value != "" {
+			return value
+		}
+	}
+
+	idToken := strings.TrimSpace(stringValue(auth.Metadata, "id_token"))
+	if idToken == "" {
+		return ""
+	}
+	claims, errParse := codex.ParseJWTToken(idToken)
+	if errParse != nil || claims == nil {
+		return ""
+	}
+	return strings.TrimSpace(claims.GetAccountID())
 }
 
 func (h *Handler) verifyAuthTokenState(ctx context.Context, auth *coreauth.Auth) (bool, string, error) {
