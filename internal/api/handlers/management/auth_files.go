@@ -600,7 +600,11 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
+	if queryTruthy(c.Query("failed")) {
+		h.deleteFailedAuthFiles(c, ctx)
+		return
+	}
+	if queryTruthy(c.Query("all")) {
 		entries, err := os.ReadDir(h.cfg.AuthDir)
 		if err != nil {
 			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
@@ -658,6 +662,105 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	}
 	h.disableAuth(ctx, full)
 	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func queryTruthy(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on", "*":
+		return true
+	default:
+		return false
+	}
+}
+
+func isFailedAuthFileCandidate(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return false
+	}
+	if isRuntimeOnlyAuth(auth) {
+		return false
+	}
+	return auth.Unavailable
+}
+
+func (h *Handler) resolveAuthFilePath(auth *coreauth.Auth) (string, bool) {
+	if auth == nil {
+		return "", false
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" {
+		path = strings.TrimSpace(auth.FileName)
+	}
+	if path == "" {
+		path = strings.TrimSpace(auth.ID)
+	}
+	if path == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(path) {
+		if h == nil || h.cfg == nil || strings.TrimSpace(h.cfg.AuthDir) == "" {
+			return "", false
+		}
+		path = filepath.Join(h.cfg.AuthDir, path)
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if !strings.HasSuffix(strings.ToLower(path), ".json") {
+		return "", false
+	}
+	if h == nil || h.cfg == nil {
+		return path, true
+	}
+	baseDir := strings.TrimSpace(h.cfg.AuthDir)
+	if baseDir == "" {
+		return path, true
+	}
+	if !filepath.IsAbs(baseDir) {
+		if abs, err := filepath.Abs(baseDir); err == nil {
+			baseDir = abs
+		}
+	}
+	rel, err := filepath.Rel(baseDir, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return path, true
+}
+
+func (h *Handler) deleteFailedAuthFiles(c *gin.Context, ctx context.Context) {
+	auths := h.authManager.List()
+	deleted := 0
+	matched := 0
+	seenPaths := make(map[string]struct{})
+	for _, auth := range auths {
+		if !isFailedAuthFileCandidate(auth) {
+			continue
+		}
+		path, ok := h.resolveAuthFilePath(auth)
+		if !ok {
+			continue
+		}
+		if _, exists := seenPaths[path]; exists {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		matched++
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to remove file: %v", err)})
+			return
+		}
+		if err := h.deleteTokenRecord(ctx, path); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		h.disableAuth(ctx, path)
+		deleted++
+	}
+	c.JSON(200, gin.H{"status": "ok", "deleted": deleted, "matched": matched, "scope": "failed"})
 }
 
 func (h *Handler) authIDForPath(path string) string {
