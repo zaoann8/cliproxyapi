@@ -913,12 +913,19 @@ func (h *Handler) verifyCodexAuthToken(ctx context.Context, auth *coreauth.Auth)
 	accessToken := strings.TrimSpace(stringValue(metadata, "access_token"))
 	refreshToken := strings.TrimSpace(stringValue(metadata, "refresh_token"))
 
+	// Fast path: access token still valid, no need to hit upstream refresh endpoint.
+	if accessToken != "" && !codexTokenExpired(metadata) {
+		return false, "", nil
+	}
+
 	if refreshToken != "" {
 		if h == nil || h.cfg == nil {
 			return true, "codex config unavailable", nil
 		}
+		refreshCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
 		svc := codex.NewCodexAuth(h.cfg)
-		tokenData, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+		tokenData, err := svc.RefreshTokensWithRetry(refreshCtx, refreshToken, 3)
 		if err != nil {
 			return true, normalizeTokenInvalidReason(fmt.Sprintf("refresh failed: %v", err)), nil
 		}
