@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -262,6 +263,10 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth)
 		return token, errToken
 	}
+	if provider == "codex" {
+		token, errToken := h.refreshCodexOAuthAccessToken(ctx, auth)
+		return token, errToken
+	}
 
 	return tokenValueForAuth(auth), nil
 }
@@ -454,6 +459,94 @@ func antigravityTokenNeedsRefresh(metadata map[string]any) bool {
 		return !exp.After(time.Now().Add(skew))
 	}
 	return true
+}
+
+func (h *Handler) refreshCodexOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if auth == nil {
+		return "", nil
+	}
+	metadata := auth.Metadata
+	if len(metadata) == 0 {
+		return "", fmt.Errorf("codex oauth metadata missing")
+	}
+
+	currentAccessToken := strings.TrimSpace(stringValue(metadata, "access_token"))
+	if currentAccessToken == "" {
+		if tokenRaw, ok := metadata["token"].(map[string]any); ok && tokenRaw != nil {
+			if tokenValue, okToken := tokenRaw["access_token"].(string); okToken {
+				currentAccessToken = strings.TrimSpace(tokenValue)
+			}
+		}
+	}
+	refreshToken := strings.TrimSpace(stringValue(metadata, "refresh_token"))
+	if refreshToken == "" {
+		if currentAccessToken == "" {
+			return "", fmt.Errorf("codex access token missing")
+		}
+		if codexTokenNeedsRefresh(metadata) {
+			return "", fmt.Errorf("codex token expired and refresh token missing")
+		}
+		return currentAccessToken, nil
+	}
+	if currentAccessToken != "" && !codexTokenNeedsRefresh(metadata) {
+		return currentAccessToken, nil
+	}
+	if h == nil || h.cfg == nil {
+		return "", fmt.Errorf("codex config unavailable")
+	}
+
+	svc := codexauth.NewCodexAuth(h.cfg)
+	tokenData, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	if err != nil {
+		return "", err
+	}
+
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["type"] = "codex"
+	auth.Metadata["access_token"] = tokenData.AccessToken
+	if tokenData.RefreshToken != "" {
+		auth.Metadata["refresh_token"] = tokenData.RefreshToken
+	}
+	if tokenData.IDToken != "" {
+		auth.Metadata["id_token"] = tokenData.IDToken
+	}
+	if tokenData.AccountID != "" {
+		auth.Metadata["account_id"] = tokenData.AccountID
+	}
+	if tokenData.Email != "" {
+		auth.Metadata["email"] = tokenData.Email
+	}
+	if tokenData.Expire != "" {
+		auth.Metadata["expired"] = tokenData.Expire
+	}
+	auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
+
+	if h != nil && h.authManager != nil {
+		auth.LastRefreshedAt = time.Now()
+		auth.UpdatedAt = time.Now()
+		_, _ = h.authManager.Update(ctx, auth)
+	}
+	return strings.TrimSpace(tokenData.AccessToken), nil
+}
+
+func codexTokenNeedsRefresh(metadata map[string]any) bool {
+	if len(metadata) == 0 {
+		return true
+	}
+	expired := strings.TrimSpace(stringValue(metadata, "expired"))
+	if expired == "" {
+		return true
+	}
+	expAt, err := time.Parse(time.RFC3339, expired)
+	if err != nil {
+		return true
+	}
+	return !expAt.After(time.Now().Add(30 * time.Second))
 }
 
 func int64Value(raw any) int64 {

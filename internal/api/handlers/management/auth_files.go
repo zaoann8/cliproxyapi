@@ -50,6 +50,9 @@ const (
 	geminiCLIUserAgent      = "google-api-nodejs-client/9.15.1"
 	geminiCLIApiClient      = "gl-node/22.17.0"
 	geminiCLIClientMetadata = "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI"
+	tokenInvalidMetaKey     = "token_invalid"
+	tokenInvalidReasonKey   = "token_invalid_reason"
+	tokenInvalidAtKey       = "token_invalid_at"
 )
 
 type callbackForwarder struct {
@@ -385,6 +388,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"source":         "memory",
 		"size":           int64(0),
 	}
+	tokenInvalid, tokenInvalidReason := tokenInvalidState(auth)
+	entry["token_invalid"] = tokenInvalid
+	if tokenInvalidReason != "" {
+		entry["token_invalid_reason"] = tokenInvalidReason
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}
@@ -600,6 +608,10 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	if queryTruthy(c.Query("invalid")) {
+		h.deleteInvalidAuthFiles(c, ctx)
+		return
+	}
 	if queryTruthy(c.Query("failed")) {
 		h.deleteFailedAuthFiles(c, ctx)
 		return
@@ -673,6 +685,66 @@ func queryTruthy(raw string) bool {
 	}
 }
 
+func metadataTruthy(raw any) bool {
+	switch typed := raw.(type) {
+	case bool:
+		return typed
+	case string:
+		return queryTruthy(typed)
+	case int:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case float64:
+		return typed != 0
+	default:
+		return false
+	}
+}
+
+func tokenInvalidState(auth *coreauth.Auth) (bool, string) {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false, ""
+	}
+	invalid := metadataTruthy(auth.Metadata[tokenInvalidMetaKey])
+	reason, _ := auth.Metadata[tokenInvalidReasonKey].(string)
+	return invalid, strings.TrimSpace(reason)
+}
+
+func setTokenInvalidState(auth *coreauth.Auth, invalid bool, reason string) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	if invalid {
+		auth.Metadata[tokenInvalidMetaKey] = true
+		auth.Metadata[tokenInvalidAtKey] = time.Now().UTC().Format(time.RFC3339)
+		trimmedReason := strings.TrimSpace(reason)
+		if trimmedReason != "" {
+			auth.Metadata[tokenInvalidReasonKey] = trimmedReason
+		} else {
+			delete(auth.Metadata, tokenInvalidReasonKey)
+		}
+		return
+	}
+	delete(auth.Metadata, tokenInvalidMetaKey)
+	delete(auth.Metadata, tokenInvalidReasonKey)
+	delete(auth.Metadata, tokenInvalidAtKey)
+}
+
+func isInvalidAuthFileCandidate(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if isRuntimeOnlyAuth(auth) {
+		return false
+	}
+	invalid, _ := tokenInvalidState(auth)
+	return invalid
+}
+
 func isFailedAuthFileCandidate(auth *coreauth.Auth) bool {
 	if auth == nil {
 		return false
@@ -731,6 +803,38 @@ func (h *Handler) resolveAuthFilePath(auth *coreauth.Auth) (string, bool) {
 	return path, true
 }
 
+func (h *Handler) deleteInvalidAuthFiles(c *gin.Context, ctx context.Context) {
+	auths := h.authManager.List()
+	deleted := 0
+	matched := 0
+	seenPaths := make(map[string]struct{})
+	for _, auth := range auths {
+		if !isInvalidAuthFileCandidate(auth) {
+			continue
+		}
+		path, ok := h.resolveAuthFilePath(auth)
+		if !ok {
+			continue
+		}
+		if _, exists := seenPaths[path]; exists {
+			continue
+		}
+		seenPaths[path] = struct{}{}
+		matched++
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to remove file: %v", err)})
+			return
+		}
+		if err := h.deleteTokenRecord(ctx, path); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		h.disableAuth(ctx, path)
+		deleted++
+	}
+	c.JSON(200, gin.H{"status": "ok", "deleted": deleted, "matched": matched, "scope": "invalid"})
+}
+
 func (h *Handler) deleteFailedAuthFiles(c *gin.Context, ctx context.Context) {
 	auths := h.authManager.List()
 	deleted := 0
@@ -761,6 +865,216 @@ func (h *Handler) deleteFailedAuthFiles(c *gin.Context, ctx context.Context) {
 		deleted++
 	}
 	c.JSON(200, gin.H{"status": "ok", "deleted": deleted, "matched": matched, "scope": "failed"})
+}
+
+func normalizeTokenInvalidReason(raw string) string {
+	reason := strings.TrimSpace(raw)
+	if reason == "" {
+		return ""
+	}
+	const maxLen = 240
+	if len(reason) <= maxLen {
+		return reason
+	}
+	return reason[:maxLen]
+}
+
+func isSupportedTokenVerifyProvider(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "codex", "gemini-cli", "antigravity":
+		return true
+	default:
+		return false
+	}
+}
+
+func codexTokenExpired(metadata map[string]any) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	expired := strings.TrimSpace(stringValue(metadata, "expired"))
+	if expired == "" {
+		return false
+	}
+	parseLayouts := []string{time.RFC3339, time.RFC3339Nano}
+	for _, layout := range parseLayouts {
+		if ts, err := time.Parse(layout, expired); err == nil {
+			return !ts.After(time.Now().Add(30 * time.Second))
+		}
+	}
+	return false
+}
+
+func (h *Handler) verifyCodexAuthToken(ctx context.Context, auth *coreauth.Auth) (bool, string, error) {
+	if auth == nil {
+		return true, "auth is nil", nil
+	}
+	metadata := auth.Metadata
+	accessToken := strings.TrimSpace(stringValue(metadata, "access_token"))
+	refreshToken := strings.TrimSpace(stringValue(metadata, "refresh_token"))
+
+	if refreshToken != "" {
+		if h == nil || h.cfg == nil {
+			return true, "codex config unavailable", nil
+		}
+		svc := codex.NewCodexAuth(h.cfg)
+		tokenData, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+		if err != nil {
+			return true, normalizeTokenInvalidReason(fmt.Sprintf("refresh failed: %v", err)), nil
+		}
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		auth.Metadata["type"] = "codex"
+		auth.Metadata["access_token"] = tokenData.AccessToken
+		if tokenData.RefreshToken != "" {
+			auth.Metadata["refresh_token"] = tokenData.RefreshToken
+		}
+		if tokenData.IDToken != "" {
+			auth.Metadata["id_token"] = tokenData.IDToken
+		}
+		if tokenData.AccountID != "" {
+			auth.Metadata["account_id"] = tokenData.AccountID
+		}
+		if tokenData.Email != "" {
+			auth.Metadata["email"] = tokenData.Email
+		}
+		if tokenData.Expire != "" {
+			auth.Metadata["expired"] = tokenData.Expire
+		}
+		auth.Metadata["last_refresh"] = time.Now().UTC().Format(time.RFC3339)
+		return false, "", nil
+	}
+
+	if accessToken == "" {
+		return true, "missing access_token and refresh_token", nil
+	}
+	if codexTokenExpired(metadata) {
+		return true, "access_token expired and refresh_token missing", nil
+	}
+	return false, "", nil
+}
+
+func (h *Handler) verifyAuthTokenState(ctx context.Context, auth *coreauth.Auth) (bool, string, error) {
+	if auth == nil {
+		return false, "", nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if !isSupportedTokenVerifyProvider(provider) {
+		return false, "", nil
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return false, "", nil
+	}
+	if isRuntimeOnlyAuth(auth) {
+		return false, "", nil
+	}
+
+	var (
+		invalid bool
+		reason  string
+		err     error
+	)
+	switch provider {
+	case "codex":
+		invalid, reason, err = h.verifyCodexAuthToken(ctx, auth)
+	default:
+		var token string
+		token, err = h.resolveTokenForAuth(ctx, auth)
+		if err != nil {
+			invalid = true
+			reason = normalizeTokenInvalidReason(fmt.Sprintf("token refresh failed: %v", err))
+		} else if strings.TrimSpace(token) == "" {
+			invalid = true
+			reason = "token is empty"
+		}
+	}
+	if err != nil {
+		return false, "", err
+	}
+
+	setTokenInvalidState(auth, invalid, reason)
+	auth.UpdatedAt = time.Now()
+	if _, errUpdate := h.authManager.Update(ctx, auth); errUpdate != nil {
+		return false, "", errUpdate
+	}
+	return invalid, reason, nil
+}
+
+func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	ctx := c.Request.Context()
+	providerFilter := strings.ToLower(strings.TrimSpace(c.DefaultQuery("provider", "codex")))
+	if providerFilter == "all" || providerFilter == "*" {
+		providerFilter = ""
+	}
+
+	auths := h.authManager.List()
+	checked := 0
+	validCount := 0
+	invalidCount := 0
+	skippedCount := 0
+	results := make([]gin.H, 0, len(auths))
+
+	for _, auth := range auths {
+		if auth == nil {
+			skippedCount++
+			continue
+		}
+		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+		if providerFilter != "" && provider != providerFilter {
+			continue
+		}
+		if !isSupportedTokenVerifyProvider(provider) {
+			skippedCount++
+			continue
+		}
+		if auth.Disabled || auth.Status == coreauth.StatusDisabled || isRuntimeOnlyAuth(auth) {
+			skippedCount++
+			continue
+		}
+
+		checked++
+		invalid, reason, errVerify := h.verifyAuthTokenState(ctx, auth)
+		if errVerify != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to verify token for %s: %v", auth.ID, errVerify)})
+			return
+		}
+
+		name := strings.TrimSpace(auth.FileName)
+		if name == "" {
+			name = strings.TrimSpace(auth.ID)
+		}
+		item := gin.H{
+			"id":       auth.ID,
+			"name":     name,
+			"provider": provider,
+			"invalid":  invalid,
+		}
+		if reason != "" {
+			item["reason"] = reason
+		}
+		results = append(results, item)
+		if invalid {
+			invalidCount++
+		} else {
+			validCount++
+		}
+	}
+
+	c.JSON(200, gin.H{
+		"status":   "ok",
+		"scope":    "invalid",
+		"provider": providerFilter,
+		"checked":  checked,
+		"valid":    validCount,
+		"invalid":  invalidCount,
+		"skipped":  skippedCount,
+		"results":  results,
+	})
 }
 
 func (h *Handler) authIDForPath(path string) string {
