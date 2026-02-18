@@ -688,6 +688,24 @@ func queryTruthy(raw string) bool {
 	}
 }
 
+func parsePositiveInt(raw string, defaultValue, minValue, maxValue int) int {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	if parsed < minValue {
+		return minValue
+	}
+	if maxValue > 0 && parsed > maxValue {
+		return maxValue
+	}
+	return parsed
+}
+
 func metadataTruthy(raw any) bool {
 	switch typed := raw.(type) {
 	case bool:
@@ -1051,13 +1069,17 @@ func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
 	if providerFilter == "all" || providerFilter == "*" {
 		providerFilter = ""
 	}
+	const (
+		defaultVerifyConcurrency = 20
+		maxVerifyConcurrency     = 50
+	)
+	concurrency := parsePositiveInt(c.Query("concurrency"), defaultVerifyConcurrency, 1, maxVerifyConcurrency)
 
 	auths := h.authManager.List()
-	checked := 0
 	validCount := 0
 	invalidCount := 0
 	skippedCount := 0
-	results := make([]gin.H, 0, len(auths))
+	candidates := make([]*coreauth.Auth, 0, len(auths))
 
 	for _, auth := range auths {
 		if auth == nil {
@@ -1076,44 +1098,111 @@ func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
 			skippedCount++
 			continue
 		}
+		candidates = append(candidates, auth)
+	}
 
-		checked++
-		invalid, reason, errVerify := h.verifyAuthTokenState(ctx, auth)
-		if errVerify != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to verify token for %s: %v", auth.ID, errVerify)})
-			return
+	if len(candidates) == 0 {
+		c.JSON(200, gin.H{
+			"status":      "ok",
+			"scope":       "invalid",
+			"provider":    providerFilter,
+			"concurrency": concurrency,
+			"checked":     0,
+			"valid":       0,
+			"invalid":     0,
+			"skipped":     skippedCount,
+			"results":     []gin.H{},
+		})
+		return
+	}
+
+	if concurrency > len(candidates) {
+		concurrency = len(candidates)
+	}
+
+	type verifyResult struct {
+		auth    *coreauth.Auth
+		invalid bool
+		reason  string
+		err     error
+	}
+
+	jobs := make(chan *coreauth.Auth)
+	resultsCh := make(chan verifyResult, len(candidates))
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for auth := range jobs {
+			invalid, reason, errVerify := h.verifyAuthTokenState(ctx, auth)
+			resultsCh <- verifyResult{
+				auth:    auth,
+				invalid: invalid,
+				reason:  reason,
+				err:     errVerify,
+			}
+		}
+	}
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	for _, auth := range candidates {
+		jobs <- auth
+	}
+	close(jobs)
+	wg.Wait()
+	close(resultsCh)
+
+	results := make([]gin.H, 0, len(candidates))
+	var firstErr error
+	for res := range resultsCh {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to verify token for %s: %w", res.auth.ID, res.err)
+			}
+			continue
 		}
 
-		name := strings.TrimSpace(auth.FileName)
+		provider := strings.ToLower(strings.TrimSpace(res.auth.Provider))
+		name := strings.TrimSpace(res.auth.FileName)
 		if name == "" {
-			name = strings.TrimSpace(auth.ID)
+			name = strings.TrimSpace(res.auth.ID)
 		}
+
 		item := gin.H{
-			"id":       auth.ID,
+			"id":       res.auth.ID,
 			"name":     name,
 			"provider": provider,
-			"invalid":  invalid,
+			"invalid":  res.invalid,
 		}
-		if reason != "" {
-			item["reason"] = reason
+		if res.reason != "" {
+			item["reason"] = res.reason
 		}
+
 		results = append(results, item)
-		if invalid {
+		if res.invalid {
 			invalidCount++
 		} else {
 			validCount++
 		}
 	}
+	if firstErr != nil {
+		c.JSON(500, gin.H{"error": firstErr.Error()})
+		return
+	}
 
 	c.JSON(200, gin.H{
-		"status":   "ok",
-		"scope":    "invalid",
-		"provider": providerFilter,
-		"checked":  checked,
-		"valid":    validCount,
-		"invalid":  invalidCount,
-		"skipped":  skippedCount,
-		"results":  results,
+		"status":      "ok",
+		"scope":       "invalid",
+		"provider":    providerFilter,
+		"concurrency": concurrency,
+		"checked":     len(candidates),
+		"valid":       validCount,
+		"invalid":     invalidCount,
+		"skipped":     skippedCount,
+		"results":     results,
 	})
 }
 
