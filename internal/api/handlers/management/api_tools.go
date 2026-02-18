@@ -209,12 +209,35 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	h.syncTokenInvalidStateFromAPICall(c.Request.Context(), auth, resp.StatusCode, string(respBody))
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+func (h *Handler) syncTokenInvalidStateFromAPICall(ctx context.Context, auth *coreauth.Auth, statusCode int, body string) {
+	if h == nil || h.authManager == nil || auth == nil {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+
+	if statusCode == http.StatusUnauthorized {
+		reason := normalizeTokenInvalidReason(strings.TrimSpace(fmt.Sprintf("401 %s", body)))
+		setTokenInvalidState(auth, true, reason)
+		auth.UpdatedAt = time.Now()
+		_, _ = h.authManager.Update(ctx, auth)
+		return
+	}
+	if statusCode >= 200 && statusCode < 300 {
+		setTokenInvalidState(auth, false, "")
+		auth.UpdatedAt = time.Now()
+		_, _ = h.authManager.Update(ctx, auth)
+	}
 }
 
 func firstNonEmptyString(values ...*string) string {
