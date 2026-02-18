@@ -38,6 +38,9 @@ type Config struct {
 	// RemoteManagement nests management-related options under 'remote-management'.
 	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
 
+	// AuthInspection controls automatic auth token inspection scheduler behavior.
+	AuthInspection AuthInspectionConfig `yaml:"auth-inspection,omitempty" json:"auth-inspection,omitempty"`
+
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
 
@@ -146,6 +149,16 @@ type RemoteManagement struct {
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
+}
+
+// AuthInspectionConfig controls background token inspection and optional cleanup.
+type AuthInspectionConfig struct {
+	// Enabled enables periodic inspection when true.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// IntervalSeconds controls the scheduler interval in seconds.
+	IntervalSeconds int `yaml:"interval-seconds,omitempty" json:"interval-seconds,omitempty"`
+	// AutoDeleteInvalid removes invalid auth files automatically after each run when true.
+	AutoDeleteInvalid bool `yaml:"auto-delete-invalid,omitempty" json:"auto-delete-invalid,omitempty"`
 }
 
 // QuotaExceeded defines the behavior when API quota limits are exceeded.

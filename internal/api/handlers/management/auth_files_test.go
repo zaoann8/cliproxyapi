@@ -397,3 +397,89 @@ func TestVerifyInvalidAuthFiles_CodexClearsInvalidOn2xx(t *testing.T) {
 		t.Fatalf("expected empty reason after success, got %q", reason)
 	}
 }
+
+func TestVerifyInvalidAuthFiles_CodexBatchCursor(t *testing.T) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &memoryAuthStore{}
+	manager := coreauth.NewManager(store, nil, nil)
+
+	for _, id := range []string{"codex-a.json", "codex-b.json", "codex-c.json"} {
+		auth := &coreauth.Auth{
+			ID:       id,
+			FileName: id,
+			Provider: "codex",
+			Status:   coreauth.StatusActive,
+			Metadata: map[string]any{
+				"type":         "codex",
+				"access_token": "ok-token",
+				"expired":      "2099-01-01T00:00:00Z",
+			},
+		}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth: %v", err)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	originalProbeURL := codexUsageProbeURL
+	codexUsageProbeURL = srv.URL
+	t.Cleanup(func() {
+		codexUsageProbeURL = originalProbeURL
+	})
+
+	h := &Handler{
+		cfg:         &config.Config{AuthDir: authDir},
+		authManager: manager,
+		tokenStore:  store,
+	}
+
+	rec1 := httptest.NewRecorder()
+	ctx1, _ := gin.CreateTestContext(rec1)
+	ctx1.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/verify-invalid?provider=codex&batch_size=2&cursor=0&concurrency=5", nil)
+	h.VerifyInvalidAuthFiles(ctx1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("unexpected status (round1): %d body=%s", rec1.Code, rec1.Body.String())
+	}
+	var resp1 map[string]any
+	if err := json.Unmarshal(rec1.Body.Bytes(), &resp1); err != nil {
+		t.Fatalf("decode response round1: %v", err)
+	}
+	if got, _ := resp1["checked"].(float64); got != 2 {
+		t.Fatalf("expected checked=2 in round1, got %v", resp1["checked"])
+	}
+	if got, _ := resp1["total"].(float64); got != 3 {
+		t.Fatalf("expected total=3 in round1, got %v", resp1["total"])
+	}
+	if done, _ := resp1["done"].(bool); done {
+		t.Fatalf("expected done=false in round1")
+	}
+	if got, _ := resp1["next_cursor"].(float64); got != 2 {
+		t.Fatalf("expected next_cursor=2 in round1, got %v", resp1["next_cursor"])
+	}
+
+	rec2 := httptest.NewRecorder()
+	ctx2, _ := gin.CreateTestContext(rec2)
+	ctx2.Request = httptest.NewRequest(http.MethodPost, "/v0/management/auth-files/verify-invalid?provider=codex&batch_size=2&cursor=2&concurrency=5", nil)
+	h.VerifyInvalidAuthFiles(ctx2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("unexpected status (round2): %d body=%s", rec2.Code, rec2.Body.String())
+	}
+	var resp2 map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &resp2); err != nil {
+		t.Fatalf("decode response round2: %v", err)
+	}
+	if got, _ := resp2["checked"].(float64); got != 1 {
+		t.Fatalf("expected checked=1 in round2, got %v", resp2["checked"])
+	}
+	if done, _ := resp2["done"].(bool); !done {
+		t.Fatalf("expected done=true in round2")
+	}
+}

@@ -47,6 +47,10 @@ type Handler struct {
 	allowRemoteOverride bool
 	envSecret           string
 	logDir              string
+
+	inspectionMu      sync.RWMutex
+	inspectionStatus  authInspectionStatus
+	inspectionTrigger chan string
 }
 
 // NewHandler creates a new management handler instance.
@@ -65,6 +69,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:           envSecret,
 	}
 	h.startAttemptCleanup()
+	h.startAuthInspectionScheduler()
 	return h
 }
 

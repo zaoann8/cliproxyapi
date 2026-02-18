@@ -825,6 +825,15 @@ func (h *Handler) resolveAuthFilePath(auth *coreauth.Auth) (string, bool) {
 }
 
 func (h *Handler) deleteInvalidAuthFiles(c *gin.Context, ctx context.Context) {
+	deleted, matched, err := h.deleteInvalidAuthFilesInternal(ctx)
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"status": "ok", "deleted": deleted, "matched": matched, "scope": "invalid"})
+}
+
+func (h *Handler) deleteInvalidAuthFilesInternal(ctx context.Context) (int, int, error) {
 	auths := h.authManager.List()
 	deleted := 0
 	matched := 0
@@ -843,17 +852,15 @@ func (h *Handler) deleteInvalidAuthFiles(c *gin.Context, ctx context.Context) {
 		seenPaths[path] = struct{}{}
 		matched++
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to remove file: %v", err)})
-			return
+			return deleted, matched, fmt.Errorf("failed to remove file: %w", err)
 		}
 		if err := h.deleteTokenRecord(ctx, path); err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
-			return
+			return deleted, matched, err
 		}
 		h.disableAuth(ctx, path)
 		deleted++
 	}
-	c.JSON(200, gin.H{"status": "ok", "deleted": deleted, "matched": matched, "scope": "invalid"})
+	return deleted, matched, nil
 }
 
 func (h *Handler) deleteFailedAuthFiles(c *gin.Context, ctx context.Context) {
@@ -1059,28 +1066,33 @@ func (h *Handler) verifyAuthTokenState(ctx context.Context, auth *coreauth.Auth)
 	return invalid, reason, nil
 }
 
-func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
-	if h.authManager == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
-		return
-	}
-	ctx := c.Request.Context()
-	providerFilter := strings.ToLower(strings.TrimSpace(c.DefaultQuery("provider", "codex")))
-	if providerFilter == "all" || providerFilter == "*" {
-		providerFilter = ""
-	}
-	const (
-		defaultVerifyConcurrency = 20
-		maxVerifyConcurrency     = 50
-	)
-	concurrency := parsePositiveInt(c.Query("concurrency"), defaultVerifyConcurrency, 1, maxVerifyConcurrency)
+type verifyInvalidEntry struct {
+	ID       string
+	Name     string
+	Provider string
+	Invalid  bool
+	Reason   string
+}
 
-	auths := h.authManager.List()
-	validCount := 0
-	invalidCount := 0
+type verifyInvalidBatchResult struct {
+	Scope       string
+	Provider    string
+	Concurrency int
+	BatchSize   int
+	Cursor      int
+	NextCursor  int
+	Total       int
+	Done        bool
+	Checked     int
+	Valid       int
+	Invalid     int
+	Skipped     int
+	Results     []verifyInvalidEntry
+}
+
+func filterVerifyInvalidCandidates(auths []*coreauth.Auth, providerFilter string) ([]*coreauth.Auth, int) {
 	skippedCount := 0
 	candidates := make([]*coreauth.Auth, 0, len(auths))
-
 	for _, auth := range auths {
 		if auth == nil {
 			skippedCount++
@@ -1100,24 +1112,67 @@ func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
 		}
 		candidates = append(candidates, auth)
 	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return strings.Compare(strings.TrimSpace(candidates[i].ID), strings.TrimSpace(candidates[j].ID)) < 0
+	})
+	return candidates, skippedCount
+}
 
-	if len(candidates) == 0 {
-		c.JSON(200, gin.H{
-			"status":      "ok",
-			"scope":       "invalid",
-			"provider":    providerFilter,
-			"concurrency": concurrency,
-			"checked":     0,
-			"valid":       0,
-			"invalid":     0,
-			"skipped":     skippedCount,
-			"results":     []gin.H{},
-		})
-		return
+func (h *Handler) verifyInvalidAuthBatch(ctx context.Context, providerFilter string, concurrency, batchSize, cursor int) (*verifyInvalidBatchResult, error) {
+	auths := h.authManager.List()
+	candidates, skippedCount := filterVerifyInvalidCandidates(auths, providerFilter)
+	total := len(candidates)
+	if total == 0 || cursor >= total {
+		return &verifyInvalidBatchResult{
+			Scope:       "invalid",
+			Provider:    providerFilter,
+			Concurrency: concurrency,
+			BatchSize:   batchSize,
+			Cursor:      cursor,
+			NextCursor:  cursor,
+			Total:       total,
+			Done:        true,
+			Checked:     0,
+			Valid:       0,
+			Invalid:     0,
+			Skipped:     skippedCount,
+			Results:     []verifyInvalidEntry{},
+		}, nil
 	}
 
-	if concurrency > len(candidates) {
-		concurrency = len(candidates)
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	end := cursor + batchSize
+	if end > total {
+		end = total
+	}
+	currentBatch := candidates[cursor:end]
+	if len(currentBatch) == 0 {
+		return &verifyInvalidBatchResult{
+			Scope:       "invalid",
+			Provider:    providerFilter,
+			Concurrency: concurrency,
+			BatchSize:   batchSize,
+			Cursor:      cursor,
+			NextCursor:  end,
+			Total:       total,
+			Done:        end >= total,
+			Checked:     0,
+			Valid:       0,
+			Invalid:     0,
+			Skipped:     skippedCount,
+			Results:     []verifyInvalidEntry{},
+		}, nil
+	}
+	if concurrency > len(currentBatch) {
+		concurrency = len(currentBatch)
 	}
 
 	type verifyResult struct {
@@ -1128,8 +1183,7 @@ func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
 	}
 
 	jobs := make(chan *coreauth.Auth)
-	resultsCh := make(chan verifyResult, len(candidates))
-
+	resultsCh := make(chan verifyResult, len(currentBatch))
 	var wg sync.WaitGroup
 	worker := func() {
 		defer wg.Done()
@@ -1143,19 +1197,20 @@ func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
 			}
 		}
 	}
-
 	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go worker()
 	}
-	for _, auth := range candidates {
+	for _, auth := range currentBatch {
 		jobs <- auth
 	}
 	close(jobs)
 	wg.Wait()
 	close(resultsCh)
 
-	results := make([]gin.H, 0, len(candidates))
+	validCount := 0
+	invalidCount := 0
+	entries := make([]verifyInvalidEntry, 0, len(currentBatch))
 	var firstErr error
 	for res := range resultsCh {
 		if res.err != nil {
@@ -1164,24 +1219,19 @@ func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
 			}
 			continue
 		}
-
 		provider := strings.ToLower(strings.TrimSpace(res.auth.Provider))
 		name := strings.TrimSpace(res.auth.FileName)
 		if name == "" {
 			name = strings.TrimSpace(res.auth.ID)
 		}
-
-		item := gin.H{
-			"id":       res.auth.ID,
-			"name":     name,
-			"provider": provider,
-			"invalid":  res.invalid,
+		entry := verifyInvalidEntry{
+			ID:       res.auth.ID,
+			Name:     name,
+			Provider: provider,
+			Invalid:  res.invalid,
+			Reason:   strings.TrimSpace(res.reason),
 		}
-		if res.reason != "" {
-			item["reason"] = res.reason
-		}
-
-		results = append(results, item)
+		entries = append(entries, entry)
 		if res.invalid {
 			invalidCount++
 		} else {
@@ -1189,19 +1239,81 @@ func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
 		}
 	}
 	if firstErr != nil {
-		c.JSON(500, gin.H{"error": firstErr.Error()})
+		return nil, firstErr
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return strings.Compare(strings.TrimSpace(entries[i].ID), strings.TrimSpace(entries[j].ID)) < 0
+	})
+
+	return &verifyInvalidBatchResult{
+		Scope:       "invalid",
+		Provider:    providerFilter,
+		Concurrency: concurrency,
+		BatchSize:   batchSize,
+		Cursor:      cursor,
+		NextCursor:  end,
+		Total:       total,
+		Done:        end >= total,
+		Checked:     len(currentBatch),
+		Valid:       validCount,
+		Invalid:     invalidCount,
+		Skipped:     skippedCount,
+		Results:     entries,
+	}, nil
+}
+
+func (h *Handler) VerifyInvalidAuthFiles(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
 		return
 	}
+	ctx := c.Request.Context()
+	providerFilter := strings.ToLower(strings.TrimSpace(c.DefaultQuery("provider", "codex")))
+	if providerFilter == "all" || providerFilter == "*" {
+		providerFilter = ""
+	}
+	const (
+		defaultVerifyConcurrency = 20
+		maxVerifyConcurrency     = 50
+		defaultBatchSize         = 100
+		maxBatchSize             = 1000
+	)
+	concurrency := parsePositiveInt(c.Query("concurrency"), defaultVerifyConcurrency, 1, maxVerifyConcurrency)
+	batchSize := parsePositiveInt(c.Query("batch_size"), defaultBatchSize, 1, maxBatchSize)
+	cursor := parsePositiveInt(c.Query("cursor"), 0, 0, 1<<30)
+	result, errVerify := h.verifyInvalidAuthBatch(ctx, providerFilter, concurrency, batchSize, cursor)
+	if errVerify != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": errVerify.Error()})
+		return
+	}
+	results := make([]gin.H, 0, len(result.Results))
+	for _, item := range result.Results {
+		row := gin.H{
+			"id":       item.ID,
+			"name":     item.Name,
+			"provider": item.Provider,
+			"invalid":  item.Invalid,
+		}
+		if item.Reason != "" {
+			row["reason"] = item.Reason
+		}
+		results = append(results, row)
+	}
 
-	c.JSON(200, gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"status":      "ok",
-		"scope":       "invalid",
-		"provider":    providerFilter,
-		"concurrency": concurrency,
-		"checked":     len(candidates),
-		"valid":       validCount,
-		"invalid":     invalidCount,
-		"skipped":     skippedCount,
+		"scope":       result.Scope,
+		"provider":    result.Provider,
+		"concurrency": result.Concurrency,
+		"batch_size":  result.BatchSize,
+		"cursor":      result.Cursor,
+		"next_cursor": result.NextCursor,
+		"total":       result.Total,
+		"done":        result.Done,
+		"checked":     result.Checked,
+		"valid":       result.Valid,
+		"invalid":     result.Invalid,
+		"skipped":     result.Skipped,
 		"results":     results,
 	})
 }

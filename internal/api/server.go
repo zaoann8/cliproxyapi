@@ -616,6 +616,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.POST("/auth-files/verify-invalid", s.mgmt.VerifyInvalidAuthFiles)
+		mgmt.GET("/auth-files/inspection-config", s.mgmt.GetAuthInspectionConfig)
+		mgmt.PUT("/auth-files/inspection-config", s.mgmt.PutAuthInspectionConfig)
+		mgmt.PATCH("/auth-files/inspection-config", s.mgmt.PutAuthInspectionConfig)
+		mgmt.GET("/auth-files/inspection-status", s.mgmt.GetAuthInspectionStatus)
+		mgmt.POST("/auth-files/inspection-run", s.mgmt.RunAuthInspectionNow)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
